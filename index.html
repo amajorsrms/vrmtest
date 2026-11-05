@@ -194,12 +194,12 @@ function applyTracking(res) {
     em.setValue('happy', ease('hp', clamp01(((b.mouthSmileLeft + b.mouthSmileRight) / 2) * 1.5)));
   }
 
-  // Head rotation (mirrored: yaw and roll are flipped, pitch is not)
+  // Head rotation (all three axes flipped to match the mirrored view)
   if (res.facialTransformationMatrixes?.length) {
     m4.fromArray(res.facialTransformationMatrixes[0].data);
     m4.decompose(pos, quat, scl);
     euler.setFromQuaternion(quat, 'YXZ');
-    const target = new THREE.Quaternion().setFromEuler(new THREE.Euler(euler.x, -euler.y, -euler.z, 'YXZ'));
+    const target = new THREE.Quaternion().setFromEuler(new THREE.Euler(-euler.x, -euler.y, -euler.z, 'YXZ'));
     const head = vrm.humanoid.getNormalizedBoneNode('head');
     const neck = vrm.humanoid.getNormalizedBoneNode('neck');
     // Split the motion between neck and head for a more natural look
