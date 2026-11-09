@@ -16,6 +16,9 @@
   label { display: flex; align-items: center; gap: 6px; }
   #status { opacity: .85; line-height: 1.3; }
   #cam { width: 100%; border-radius: 6px; transform: scaleX(-1); display: none; background: #000; }
+  #meter { position: relative; height: 6px; background: #333; border-radius: 3px; margin: 6px 0 4px; }
+  #meterFill { height: 100%; width: 0; background: #6c5ce7; border-radius: 3px; }
+  #meterMark { position: absolute; top: -2px; width: 2px; height: 10px; background: #fff; }
   .row { display: flex; gap: 6px; }
   .row > * { flex: 1; }
 </style>
@@ -45,6 +48,12 @@
   <label><input id="swap" type="checkbox"> Swap winks (L/R)</label>
   <label><input id="body" type="checkbox" checked> Track upper body</label>
   <label><input id="smooth" type="checkbox" checked> Smooth motion</label>
+  <label><input id="mic" type="checkbox"> Mic lip-sync (beard mode)</label>
+  <div id="micBox" style="display:none">
+    <div id="meter"><div id="meterFill"></div><div id="meterMark"></div></div>
+    <input id="micThr" type="range" min="0.005" max="0.15" step="0.005" value="0.03" style="width:100%" title="Sound threshold">
+    <small>Talk: the bar should pass the white mark. Slide left for more sensitive.</small>
+  </div>
   <input id="smoothAmt" type="range" min="0" max="1" step="0.05" value="0.7" title="Smoothing strength (higher = smoother but laggier)">
   <button id="hideBtn" class="alt">Hide panel</button>
   <div id="status">Loading model…</div>
@@ -188,9 +197,11 @@ function applyTracking(res) {
     const em = vrm.expressionManager;
     em.setValue('blinkLeft',  ease('bl', clamp01(l * 1.3), 0.6));
     em.setValue('blinkRight', ease('br', clamp01(r * 1.3), 0.6));
-    em.setValue('aa',    ease('aa', clamp01(b.jawOpen * 1.5)));
-    em.setValue('ou',    ease('ou', clamp01(b.mouthPucker * 1.2)));
-    em.setValue('oh',    ease('oh', clamp01(b.mouthFunnel * 1.2)));
+    if (!micMode()) { // in mic mode the mouth shapes come from sound instead
+      em.setValue('aa', ease('aa', clamp01(b.jawOpen * 1.5)));
+      em.setValue('ou', ease('ou', clamp01(b.mouthPucker * 1.2)));
+      em.setValue('oh', ease('oh', clamp01(b.mouthFunnel * 1.2)));
+    }
     em.setValue('happy', ease('hp', clamp01(((b.mouthSmileLeft + b.mouthSmileRight) / 2) * 1.5)));
   }
 
@@ -301,6 +312,77 @@ function applyPose(res) {
   }
 }
 
+/* ---------- Mic lip-sync ---------- */
+// Sound above the threshold triggers random vowel shapes; the smile still comes from face tracking.
+let audioCtx = null, micStream = null, analyser = null, micBuf = null;
+let micLevel = 0, talkUntil = 0, vowel = 'aa', vowelUntil = 0, openAmt = 1;
+const VOWELS = ['aa', 'ih', 'ou', 'ee', 'oh'];
+const mouth = { aa: 0, ih: 0, ou: 0, ee: 0, oh: 0 };
+const METER_MAX = 0.15;
+const micMode = () => $('mic').checked && !!analyser;
+
+async function startMic() {
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true }, video: false
+    });
+    audioCtx = new AudioContext();
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 1024;
+    audioCtx.createMediaStreamSource(micStream).connect(analyser);
+    micBuf = new Float32Array(analyser.fftSize);
+    return true;
+  } catch (err) {
+    status('Microphone failed: ' + err.message);
+    return false;
+  }
+}
+function stopMic() {
+  micStream?.getTracks().forEach((t) => t.stop());
+  audioCtx?.close();
+  micStream = audioCtx = analyser = null;
+  micLevel = 0;
+  for (const n of VOWELS) { mouth[n] = 0; vrm?.expressionManager.setValue(n, 0); }
+}
+$('mic').addEventListener('change', async () => {
+  if ($('mic').checked) {
+    if (await startMic()) { $('micBox').style.display = 'block'; status('Mic lip-sync on.'); }
+    else $('mic').checked = false;
+  } else {
+    stopMic();
+    $('micBox').style.display = 'none';
+  }
+});
+
+function updateMouth(dt) {
+  const thr = parseFloat($('micThr').value);
+  const now = performance.now();
+
+  analyser.getFloatTimeDomainData(micBuf);
+  let sum = 0;
+  for (let i = 0; i < micBuf.length; i++) sum += micBuf[i] * micBuf[i];
+  micLevel = Math.sqrt(sum / micBuf.length);
+  if (micLevel > thr) talkUntil = now + 150; // short hold so gaps between words don't flicker
+  const talking = now < talkUntil;
+
+  if (talking && now > vowelUntil) { // pick a new random shape every 80-170 ms
+    vowel = VOWELS[Math.floor(Math.random() * VOWELS.length)];
+    vowelUntil = now + 80 + Math.random() * 90;
+    openAmt = 0.55 + Math.random() * 0.45;
+  }
+  const loud = Math.min(1, micLevel / (thr * 4)); // louder speech opens wider
+  const k = 1 - Math.exp(-dt * 20);
+  for (const n of VOWELS) {
+    const target = talking && n === vowel ? clamp01(openAmt * (0.5 + 0.5 * loud)) : 0;
+    mouth[n] += (target - mouth[n]) * k;
+    vrm.expressionManager.setValue(n, mouth[n]);
+  }
+
+  $('meterFill').style.width = Math.min(100, (micLevel / METER_MAX) * 100) + '%';
+  $('meterMark').style.left = (thr / METER_MAX) * 100 + '%';
+}
+
 /* ---------- Main loop ---------- */
 const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
@@ -313,6 +395,7 @@ renderer.setAnimationLoop(() => {
     lastPoseTime = video.currentTime;
     applyPose(poseLandmarker.detectForVideo(video, performance.now()));
   }
+  if (vrm && micMode()) updateMouth(dt);
   if (vrm) vrm.update(dt);
   renderer.render(scene, camera);
 });
